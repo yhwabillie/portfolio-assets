@@ -1,0 +1,10 @@
+{
+  "name": "portfolio-assets-video-paths",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Path-based autoplay video pages for assets in /videos",
+  "scripts": {
+    "build": "node scripts/build-static-site.mjs",
+    "start": "node server.mjs"
+  }
+}
