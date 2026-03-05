@@ -5,6 +5,10 @@ const ROOT_DIR = process.cwd();
 const VIDEOS_DIR = path.join(ROOT_DIR, "videos");
 const DIST_DIR = path.join(ROOT_DIR, "dist");
 const DIST_VIDEOS_DIR = path.join(DIST_DIR, "videos");
+const CDN_MAP_FILE = path.join(ROOT_DIR, "video-cdn-map.json");
+const DEFAULT_CDN_BASE =
+  process.env.VIDEO_CDN_BASE ??
+  "https://hhgfywdzkbdfwrhfqlbn.supabase.co/storage/v1/object/public/portfolio";
 const ALLOWED_EXTENSIONS = new Set([".mp4", ".webm", ".mov"]);
 
 function escapeHtml(input) {
@@ -16,10 +20,42 @@ function escapeHtml(input) {
     .replaceAll("'", "&#39;");
 }
 
+function getVideoMimeType(fileName) {
+  const ext = path.extname(fileName).toLowerCase();
+  if (ext === ".webm") {
+    return "video/webm";
+  }
+  if (ext === ".mov") {
+    return "video/quicktime";
+  }
+  return "video/mp4";
+}
+
+function buildDefaultCdnUrl(fileName) {
+  const base = DEFAULT_CDN_BASE.replace(/\/+$/g, "");
+  return `${base}/${encodeURIComponent(fileName)}`;
+}
+
+async function loadCdnMap() {
+  try {
+    const raw = await fs.readFile(CDN_MAP_FILE, "utf8");
+    const parsed = JSON.parse(raw);
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+      throw new Error("video-cdn-map.json must be an object map of slug to URL");
+    }
+    return parsed;
+  } catch (error) {
+    if (error && error.code === "ENOENT") {
+      return {};
+    }
+    throw error;
+  }
+}
+
 function renderIndexPage(entries) {
   const links = entries
-    .map(({ slug, fileName }) => {
-      return `<li><a href="/${encodeURIComponent(slug)}">/${escapeHtml(slug)}</a> <span class="meta">→ /videos/${escapeHtml(fileName)}</span></li>`;
+    .map(({ slug, cdnUrl, localUrl }) => {
+      return `<li><a href="/${encodeURIComponent(slug)}">/${escapeHtml(slug)}</a> <span class="meta">→ CDN: ${escapeHtml(cdnUrl)} (fallback: ${escapeHtml(localUrl)})</span></li>`;
     })
     .join("\n");
 
@@ -43,7 +79,7 @@ function renderIndexPage(entries) {
     li { margin: 10px 0; }
     a { color: #86b7ff; text-decoration: none; }
     a:hover { text-decoration: underline; }
-    .meta { color: #888; }
+    .meta { color: #888; word-break: break-all; }
   </style>
 </head>
 <body>
@@ -54,21 +90,7 @@ function renderIndexPage(entries) {
 </html>`;
 }
 
-function getVideoMimeType(fileName) {
-  const ext = path.extname(fileName).toLowerCase();
-  if (ext === ".webm") {
-    return "video/webm";
-  }
-  if (ext === ".mov") {
-    return "video/quicktime";
-  }
-  return "video/mp4";
-}
-
-function renderPlayerPage(slug, fileName) {
-  const videoPath = `/videos/${encodeURIComponent(fileName)}`;
-  const mimeType = getVideoMimeType(fileName);
-
+function renderPlayerPage(slug, cdnUrl, localUrl, mimeType) {
   return `<!doctype html>
 <html lang="ko">
 <head>
@@ -100,12 +122,37 @@ function renderPlayerPage(slug, fileName) {
   </style>
 </head>
 <body>
-  <video autoplay muted loop playsinline preload="auto">
-    <source src="${escapeHtml(videoPath)}" type="${mimeType}" />
+  <video autoplay muted loop playsinline preload="auto" data-cdn-src="${escapeHtml(cdnUrl)}" data-local-src="${escapeHtml(localUrl)}">
+    <source src="${escapeHtml(cdnUrl)}" type="${mimeType}" />
   </video>
   <script>
     const video = document.querySelector("video");
-    if (video) {
+    const source = video?.querySelector("source");
+
+    if (video && source) {
+      let fallbackApplied = false;
+
+      const applyFallback = () => {
+        if (fallbackApplied) {
+          return;
+        }
+        fallbackApplied = true;
+
+        const localSrc = video.dataset.localSrc;
+        if (!localSrc) {
+          return;
+        }
+
+        source.src = localSrc;
+        video.load();
+        video.play().catch(() => {
+          // Some browsers may still block autoplay despite muted attr.
+        });
+      };
+
+      video.addEventListener("error", applyFallback);
+      source.addEventListener("error", applyFallback);
+
       video.play().catch(() => {
         // Some browsers may still block autoplay despite muted attr.
       });
@@ -141,6 +188,8 @@ function renderNotFoundPage() {
 }
 
 async function main() {
+  const cdnMap = await loadCdnMap();
+
   const entries = await fs.readdir(VIDEOS_DIR, { withFileTypes: true });
   const files = entries
     .filter((entry) => entry.isFile() && ALLOWED_EXTENSIONS.has(path.extname(entry.name).toLowerCase()))
@@ -154,7 +203,17 @@ async function main() {
       throw new Error(`Duplicate slug detected: ${slug}`);
     }
     slugSet.add(slug);
-    return { slug, fileName };
+
+    const localUrl = `/videos/${encodeURIComponent(fileName)}`;
+    const cdnUrl = cdnMap[slug] ?? buildDefaultCdnUrl(fileName);
+
+    return {
+      slug,
+      fileName,
+      mimeType: getVideoMimeType(fileName),
+      localUrl,
+      cdnUrl,
+    };
   });
 
   await fs.rm(DIST_DIR, { recursive: true, force: true });
@@ -167,11 +226,11 @@ async function main() {
   await fs.writeFile(path.join(DIST_DIR, "index.html"), renderIndexPage(videoEntries), "utf8");
   await fs.writeFile(path.join(DIST_DIR, "404.html"), renderNotFoundPage(), "utf8");
 
-  for (const { slug, fileName } of videoEntries) {
-    await fs.writeFile(path.join(DIST_DIR, `${slug}.html`), renderPlayerPage(slug, fileName), "utf8");
+  for (const { slug, cdnUrl, localUrl, mimeType } of videoEntries) {
+    await fs.writeFile(path.join(DIST_DIR, `${slug}.html`), renderPlayerPage(slug, cdnUrl, localUrl, mimeType), "utf8");
   }
 
-  console.log(`Built ${videoEntries.length} video pages into ${DIST_DIR}`);
+  console.log(`Built ${videoEntries.length} video pages into ${DIST_DIR} (CDN primary + local fallback)`);
 }
 
 main().catch((error) => {

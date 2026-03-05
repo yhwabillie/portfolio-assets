@@ -7,6 +7,10 @@ const PORT = Number(process.env.PORT ?? 8787);
 const HOST = process.env.HOST ?? "0.0.0.0";
 const ROOT_DIR = process.cwd();
 const VIDEOS_DIR = path.join(ROOT_DIR, "videos");
+const CDN_MAP_FILE = path.join(ROOT_DIR, "video-cdn-map.json");
+const DEFAULT_CDN_BASE =
+  process.env.VIDEO_CDN_BASE ??
+  "https://hhgfywdzkbdfwrhfqlbn.supabase.co/storage/v1/object/public/portfolio";
 
 function escapeHtml(input) {
   return input
@@ -17,7 +21,39 @@ function escapeHtml(input) {
     .replaceAll("'", "&#39;");
 }
 
-async function getVideoIndex() {
+function getVideoMimeType(fileName) {
+  const ext = path.extname(fileName).toLowerCase();
+  if (ext === ".webm") {
+    return "video/webm";
+  }
+  if (ext === ".mov") {
+    return "video/quicktime";
+  }
+  return "video/mp4";
+}
+
+function buildDefaultCdnUrl(fileName) {
+  const base = DEFAULT_CDN_BASE.replace(/\/+$/g, "");
+  return `${base}/${encodeURIComponent(fileName)}`;
+}
+
+async function loadCdnMap() {
+  try {
+    const raw = await fs.readFile(CDN_MAP_FILE, "utf8");
+    const parsed = JSON.parse(raw);
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+      throw new Error("video-cdn-map.json must be an object map of slug to URL");
+    }
+    return parsed;
+  } catch (error) {
+    if (error && error.code === "ENOENT") {
+      return {};
+    }
+    throw error;
+  }
+}
+
+async function getVideoIndex(cdnMap) {
   const entries = await fs.readdir(VIDEOS_DIR, { withFileTypes: true });
   const files = entries
     .filter((entry) => entry.isFile() && /\.(mp4|webm|mov)$/i.test(entry.name))
@@ -25,12 +61,27 @@ async function getVideoIndex() {
     .sort();
 
   const bySlug = new Map();
-  for (const file of files) {
-    const parsed = path.parse(file);
-    bySlug.set(parsed.name, file);
+  const videos = [];
+
+  for (const fileName of files) {
+    const slug = path.parse(fileName).name;
+    const localUrl = `/videos/${encodeURIComponent(fileName)}`;
+    const mapped = cdnMap[slug];
+    const cdnUrl = typeof mapped === "string" && mapped.trim() ? mapped.trim() : buildDefaultCdnUrl(fileName);
+
+    const data = {
+      slug,
+      fileName,
+      localUrl,
+      cdnUrl,
+      mimeType: getVideoMimeType(fileName),
+    };
+
+    bySlug.set(slug, data);
+    videos.push(data);
   }
 
-  return { files, bySlug };
+  return { files, videos, bySlug };
 }
 
 function sendHtml(res, statusCode, html) {
@@ -70,11 +121,10 @@ function sendNotFound(res, message = "Not found") {
   );
 }
 
-function renderIndexPage(files) {
-  const links = files
-    .map((file) => {
-      const slug = path.parse(file).name;
-      return `<li><a href="/${encodeURIComponent(slug)}">/${escapeHtml(slug)}</a> <span class="meta">→ /videos/${escapeHtml(file)}</span></li>`;
+function renderIndexPage(videos) {
+  const links = videos
+    .map(({ slug, cdnUrl, localUrl }) => {
+      return `<li><a href="/${encodeURIComponent(slug)}">/${escapeHtml(slug)}</a> <span class="meta">→ CDN: ${escapeHtml(cdnUrl)} (fallback: ${escapeHtml(localUrl)})</span></li>`;
     })
     .join("");
 
@@ -98,7 +148,7 @@ function renderIndexPage(files) {
     li { margin: 10px 0; }
     a { color: #86b7ff; text-decoration: none; }
     a:hover { text-decoration: underline; }
-    .meta { color: #888; }
+    .meta { color: #888; word-break: break-all; }
   </style>
 </head>
 <body>
@@ -109,10 +159,8 @@ function renderIndexPage(files) {
 </html>`;
 }
 
-function renderPlayerPage(slug, videoFile) {
+function renderPlayerPage(slug, cdnUrl, localUrl, mimeType) {
   const safeSlug = escapeHtml(slug);
-  const encodedVideoPath = `/videos/${encodeURIComponent(videoFile)}`;
-  const safeVideoPath = escapeHtml(encodedVideoPath);
 
   return `<!doctype html>
 <html lang="ko">
@@ -145,9 +193,42 @@ function renderPlayerPage(slug, videoFile) {
   </style>
 </head>
 <body>
-  <video autoplay muted loop playsinline preload="auto">
-    <source src="${safeVideoPath}" type="video/mp4" />
+  <video autoplay muted loop playsinline preload="auto" data-cdn-src="${escapeHtml(cdnUrl)}" data-local-src="${escapeHtml(localUrl)}">
+    <source src="${escapeHtml(cdnUrl)}" type="${mimeType}" />
   </video>
+  <script>
+    const video = document.querySelector("video");
+    const source = video?.querySelector("source");
+
+    if (video && source) {
+      let fallbackApplied = false;
+
+      const applyFallback = () => {
+        if (fallbackApplied) {
+          return;
+        }
+        fallbackApplied = true;
+
+        const fallbackSrc = video.dataset.localSrc;
+        if (!fallbackSrc) {
+          return;
+        }
+
+        source.src = fallbackSrc;
+        video.load();
+        video.play().catch(() => {
+          // Some browsers may still block autoplay despite muted attr.
+        });
+      };
+
+      video.addEventListener("error", applyFallback);
+      source.addEventListener("error", applyFallback);
+
+      video.play().catch(() => {
+        // Some browsers may still block autoplay despite muted attr.
+      });
+    }
+  </script>
 </body>
 </html>`;
 }
@@ -163,16 +244,8 @@ async function streamVideo(res, fileName) {
     return;
   }
 
-  const ext = path.extname(fileName).toLowerCase();
-  const contentType =
-    ext === ".webm"
-      ? "video/webm"
-      : ext === ".mov"
-        ? "video/quicktime"
-        : "video/mp4";
-
   res.writeHead(200, {
-    "Content-Type": contentType,
+    "Content-Type": getVideoMimeType(fileName),
     "Content-Length": stat.size,
     "Cache-Control": "public, max-age=31536000, immutable",
     "Accept-Ranges": "bytes",
@@ -193,14 +266,15 @@ const server = http.createServer(async (req, res) => {
 
   let videoIndex;
   try {
-    videoIndex = await getVideoIndex();
+    const cdnMap = await loadCdnMap();
+    videoIndex = await getVideoIndex(cdnMap);
   } catch (error) {
     sendHtml(
       res,
       500,
       `<!doctype html><html><body style="background:#000;color:#fff;font-family:monospace;padding:24px;">
       <h1>500</h1>
-      <p>Failed to read videos directory.</p>
+      <p>Failed to read videos directory or CDN map.</p>
       <pre>${escapeHtml(String(error))}</pre>
       </body></html>`
     );
@@ -208,7 +282,7 @@ const server = http.createServer(async (req, res) => {
   }
 
   if (pathname === "/" || pathname === "/index.html") {
-    sendHtml(res, 200, renderIndexPage(videoIndex.files));
+    sendHtml(res, 200, renderIndexPage(videoIndex.videos));
     return;
   }
 
@@ -223,9 +297,9 @@ const server = http.createServer(async (req, res) => {
   }
 
   const slug = pathname.replace(/^\/+|\/+$/g, "");
-  const fileForSlug = videoIndex.bySlug.get(slug);
-  if (fileForSlug) {
-    sendHtml(res, 200, renderPlayerPage(slug, fileForSlug));
+  const videoData = videoIndex.bySlug.get(slug);
+  if (videoData) {
+    sendHtml(res, 200, renderPlayerPage(slug, videoData.cdnUrl, videoData.localUrl, videoData.mimeType));
     return;
   }
 

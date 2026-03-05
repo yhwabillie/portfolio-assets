@@ -16,6 +16,14 @@ npm run build
 
 빌드 결과물은 `dist/`에 생성됩니다.
 
+## CDN 매핑
+
+- 기본 CDN 주소는 `https://hhgfywdzkbdfwrhfqlbn.supabase.co/storage/v1/object/public/portfolio/<filename>` 입니다.
+- 플레이어는 먼저 CDN URL로 재생을 시도하고, 실패하면 자동으로 로컬 `/videos/<filename>`로 fallback 됩니다.
+- `video-cdn-map.json`에 `slug: CDN_URL` 형태를 넣으면 특정 영상 CDN URL만 개별 override 할 수 있습니다.
+- 빌드 시 로컬 fallback용 파일은 항상 `dist/videos`에 복사됩니다.
+- CDN base를 바꾸려면 빌드 시 `VIDEO_CDN_BASE` 환경변수를 사용하세요.
+
 ## 경로 규칙
 
 - 원본 파일: `/videos/<파일명>`
@@ -39,4 +47,3 @@ npm run build
 - Build Command: `npm run build`
 - Output Directory: `dist`
 - Clean URLs: `true` (`/slug` 형태 URL 사용)
-# portfolio-assets
