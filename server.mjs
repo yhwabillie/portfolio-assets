@@ -11,6 +11,27 @@ const CDN_MAP_FILE = path.join(ROOT_DIR, "video-cdn-map.json");
 const DEFAULT_CDN_BASE =
   process.env.VIDEO_CDN_BASE ??
   "https://hhgfywdzkbdfwrhfqlbn.supabase.co/storage/v1/object/public/portfolio";
+const BASE_SECURITY_HEADERS = {
+  "X-Content-Type-Options": "nosniff",
+  "X-Frame-Options": "DENY",
+  "Referrer-Policy": "no-referrer",
+  "Permissions-Policy": "camera=(), microphone=(), geolocation=()",
+};
+const CONTENT_SECURITY_POLICY = [
+  "default-src 'self'",
+  "base-uri 'none'",
+  "form-action 'none'",
+  "frame-ancestors 'none'",
+  "object-src 'none'",
+  "img-src 'self' data:",
+  "style-src 'self' 'unsafe-inline'",
+  "script-src 'self' 'unsafe-inline'",
+  "media-src 'self' https:",
+].join("; ");
+const HTML_SECURITY_HEADERS = {
+  ...BASE_SECURITY_HEADERS,
+  "Content-Security-Policy": CONTENT_SECURITY_POLICY,
+};
 
 function escapeHtml(input) {
   return input
@@ -86,10 +107,55 @@ async function getVideoIndex(cdnMap) {
 
 function sendHtml(res, statusCode, html) {
   res.writeHead(statusCode, {
+    ...HTML_SECURITY_HEADERS,
     "Content-Type": "text/html; charset=utf-8",
     "Cache-Control": "no-store",
   });
   res.end(html);
+}
+
+function sendBadRequest(res, message = "Bad request") {
+  sendHtml(
+    res,
+    400,
+    `<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>400</title>
+  <style>
+    :root { color-scheme: dark; }
+    html, body { height: 100%; margin: 0; background: #000; color: #fff; font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace; }
+    body { display: grid; place-items: center; }
+    .card { max-width: 720px; padding: 24px; border: 1px solid #333; border-radius: 10px; }
+    a { color: #86b7ff; }
+  </style>
+</head>
+<body>
+  <div class="card">
+    <h1>400</h1>
+    <p>${escapeHtml(message)}</p>
+    <p><a href="/">Back to video list</a></p>
+  </div>
+</body>
+</html>`
+  );
+}
+
+function getPathname(req) {
+  let requestUrl;
+  try {
+    requestUrl = new URL(req.url ?? "/", "http://localhost");
+  } catch {
+    return { error: "Invalid request URL" };
+  }
+
+  try {
+    return { pathname: decodeURIComponent(requestUrl.pathname) };
+  } catch {
+    return { error: "Malformed URL encoding" };
+  }
 }
 
 function sendNotFound(res, message = "Not found") {
@@ -245,6 +311,7 @@ async function streamVideo(res, fileName) {
   }
 
   res.writeHead(200, {
+    ...BASE_SECURITY_HEADERS,
     "Content-Type": getVideoMimeType(fileName),
     "Content-Length": stat.size,
     "Cache-Control": "public, max-age=31536000, immutable",
@@ -254,9 +321,13 @@ async function streamVideo(res, fileName) {
   createReadStream(filePath).pipe(res);
 }
 
-const server = http.createServer(async (req, res) => {
-  const requestUrl = new URL(req.url ?? "/", `http://${req.headers.host}`);
-  const pathname = decodeURIComponent(requestUrl.pathname);
+async function handleRequest(req, res) {
+  const parsedPath = getPathname(req);
+  if ("error" in parsedPath) {
+    sendBadRequest(res, parsedPath.error);
+    return;
+  }
+  const { pathname } = parsedPath;
 
   if (pathname === "/favicon.ico") {
     res.writeHead(204);
@@ -269,13 +340,13 @@ const server = http.createServer(async (req, res) => {
     const cdnMap = await loadCdnMap();
     videoIndex = await getVideoIndex(cdnMap);
   } catch (error) {
+    console.error("Failed to build video index:", error);
     sendHtml(
       res,
       500,
       `<!doctype html><html><body style="background:#000;color:#fff;font-family:monospace;padding:24px;">
       <h1>500</h1>
-      <p>Failed to read videos directory or CDN map.</p>
-      <pre>${escapeHtml(String(error))}</pre>
+      <p>Internal server error.</p>
       </body></html>`
     );
     return;
@@ -304,6 +375,30 @@ const server = http.createServer(async (req, res) => {
   }
 
   sendNotFound(res, `Unknown path: ${pathname}`);
+}
+
+const server = http.createServer((req, res) => {
+  void handleRequest(req, res).catch((error) => {
+    console.error("Unhandled request error:", error);
+    if (res.headersSent) {
+      res.end();
+      return;
+    }
+
+    sendHtml(
+      res,
+      500,
+      `<!doctype html><html><body style="background:#000;color:#fff;font-family:monospace;padding:24px;">
+      <h1>500</h1>
+      <p>Internal server error.</p>
+      </body></html>`
+    );
+  });
+});
+
+server.on("clientError", (error, socket) => {
+  console.error("Client connection error:", error.message);
+  socket.end("HTTP/1.1 400 Bad Request\r\n\r\n");
 });
 
 server.listen(PORT, HOST, () => {
